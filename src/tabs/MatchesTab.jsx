@@ -1,37 +1,34 @@
-import { getFlag } from '../utils.js';
+import { getFlag, findEspnEvent, getEspnStatus, getEspnScore, getEspnEvents } from '../utils.js';
 import AiChat from '../components/AiChat.jsx';
 
-function findEspnId(m, espnById) {
-  const t1 = m.team1.toLowerCase().replace(/[-&\s]/g, '');
-  const t2 = m.team2.toLowerCase().replace(/[-&\s]/g, '');
-  for (const ev of Object.values(espnById || {})) {
-    if ((ev.date || '').split('T')[0] !== m.date) continue;
-    const comps = ((ev.competitions || [])[0] || {}).competitors || [];
-    if (comps.length < 2) continue;
-    const et1 = (comps[0].team?.displayName || '').toLowerCase().replace(/[-&\s]/g, '');
-    const et2 = (comps[1].team?.displayName || '').toLowerCase().replace(/[-&\s]/g, '');
-    if ((et1.includes(t1) || t1.includes(et1.slice(0,4))) && (et2.includes(t2) || t2.includes(et2.slice(0,4)))) return ev.id;
-    if ((et1.includes(t2) || t2.includes(et1.slice(0,4))) && (et2.includes(t1) || t1.includes(et2.slice(0,4)))) return ev.id;
-  }
-  return null;
-}
-
 export function MatchCard({ m, espnById, onClick }) {
-  const done = !!m.score;
-  const s = m.score ? (m.score.ft || m.score) : null;
-  const g1 = s ? s[0] : null, g2 = s ? s[1] : null;
+  const espnEv = findEspnEvent(m, espnById);
+  const espnStatus = espnEv ? getEspnStatus(espnEv) : null;
+  const isLive = espnStatus?.state === 'in';
+  const done = (!!m.score || espnStatus?.state === 'post') && !isLive;
+  const clickable = done || isLive;
+
+  let g1 = null, g2 = null;
+  if (isLive || (espnStatus?.state === 'post' && !m.score)) {
+    const sc = getEspnScore(espnEv, m);
+    g1 = sc?.g1 ?? null; g2 = sc?.g2 ?? null;
+  } else if (m.score) {
+    const s = m.score.ft || m.score;
+    g1 = s[0]; g2 = s[1];
+  }
+
   const today = new Date().toISOString().split('T')[0];
   const isToday = m.date === today;
 
   return (
     <div
-      className={`match-card${done ? ' clickable' : ''}${isToday && !done ? ' live' : ''}`}
-      onClick={done ? () => onClick(m, findEspnId(m, espnById)) : undefined}
+      className={`match-card${clickable ? ' clickable' : ''}${isLive ? ' live' : ''}`}
+      onClick={clickable ? () => onClick(m, espnEv?.id) : undefined}
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--accent)', letterSpacing: .4 }}>{m.group || m.round || ''}</span>
-        <span className={`match-status ${done ? 'status-ft' : isToday ? 'status-live' : 'status-up'}`}>
-          {done ? 'BİTTİ' : isToday ? 'BUGÜN' : 'YAK.'}
+        <span className={`match-status ${done ? 'status-ft' : isLive ? 'status-live' : isToday ? 'status-live' : 'status-up'}`}>
+          {done ? 'BİTTİ' : isLive ? `● ${espnStatus.clock || 'CANLI'}` : isToday ? 'BUGÜN' : 'YAK.'}
         </span>
       </div>
       {[[m.team1, g1, g1 !== null && g2 !== null && g1 > g2], [m.team2, g2, g1 !== null && g2 !== null && g2 > g1]].map(([team, score, win], j) => (
@@ -43,7 +40,11 @@ export function MatchCard({ m, espnById, onClick }) {
         </div>
       ))}
       <div style={{ fontSize: 9, color: 'var(--muted)', textAlign: 'right' }}>{m.ground || ''}</div>
-      {done && <div style={{ fontSize: 9, color: 'var(--accent)', textAlign: 'center' }}>↗ Detay & AI Analiz</div>}
+      {clickable && (
+        <div style={{ fontSize: 9, color: isLive ? 'var(--red)' : 'var(--accent)', textAlign: 'center' }}>
+          ↗ {isLive ? 'Canlı Takip & Olaylar' : 'Detay & AI Analiz'}
+        </div>
+      )}
     </div>
   );
 }
@@ -77,10 +78,15 @@ export default function MatchesTab({ matches, espnById, onMatchClick }) {
   );
 }
 
-export function MatchDetailModal({ match, espnData, onClose }) {
+export function MatchDetailModal({ match, espnData, liveEvent, onClose }) {
   if (!match) return null;
-  const score = match.score?.ft || match.score || null;
-  const g1 = score ? score[0] : '-', g2 = score ? score[1] : '-';
+  const espnStatus = liveEvent ? getEspnStatus(liveEvent) : null;
+  const isLive = espnStatus?.state === 'in';
+
+  const ofbScore = match.score?.ft || match.score || null;
+  const liveScore = liveEvent ? getEspnScore(liveEvent, match) : null;
+  const g1 = isLive ? (liveScore?.g1 ?? '-') : (ofbScore ? ofbScore[0] : (liveScore?.g1 ?? '-'));
+  const g2 = isLive ? (liveScore?.g2 ?? '-') : (ofbScore ? ofbScore[1] : (liveScore?.g2 ?? '-'));
   const htScore = match.score?.ht;
   const venue = match.ground || espnData?.gameInfo?.venue?.fullName || '';
   const bsTeams = espnData?.boxscore?.teams || [];
@@ -95,13 +101,18 @@ export function MatchDetailModal({ match, espnData, onClose }) {
   };
   const statEntries = Object.entries(statMap).filter(([k]) => hStats[k] || aStats[k]);
 
+  // ESPN event akışı varsa (canlı veya bitmiş maç) onu kullan — gol + kart + penaltı içerir.
+  const espnEvents = liveEvent ? getEspnEvents(liveEvent, match) : [];
   const goals1 = match.goals1 || [], goals2 = match.goals2 || [];
-  const allGoals = [
-    ...goals1.map(g => ({ ...g, team: match.team1, side: 'home' })),
-    ...goals2.map(g => ({ ...g, team: match.team2, side: 'away' })),
-  ].sort((a, b) => (parseInt(a.minute)||0) - (parseInt(b.minute)||0));
+  const allEvents = espnEvents.length > 0
+    ? espnEvents.map(e => ({ minute: e.minute, name: e.player || e.label, team: e.side === 'team1' ? match.team1 : match.team2, side: e.side === 'team1' ? 'home' : 'away', icon: e.icon, isGoal: e.kind !== 'YELLOW' && e.kind !== 'RED' }))
+    : [
+        ...goals1.map(g => ({ ...g, team: match.team1, side: 'home', icon: '⚽', isGoal: true })),
+        ...goals2.map(g => ({ ...g, team: match.team2, side: 'away', icon: '⚽', isGoal: true })),
+      ].sort((a, b) => (parseInt(a.minute) || 0) - (parseInt(b.minute) || 0));
 
-  const matchSummary = `${match.team1} ${g1}-${g2} ${match.team2} (${match.date}, ${venue}). İY: ${htScore ? htScore.join('-') : '?'}. Sahip olma: ${hStats.possessionPct||'?'}% vs ${aStats.possessionPct||'?'}%. Şut: ${hStats.totalShots||'?'}/${aStats.totalShots||'?'}. xG: ${hStats.expectedGoals||'?'}/${aStats.expectedGoals||'?'}. Goller: ${allGoals.map(g => `${g.name} ${g.minute}'`).join(', ')||'yok'}.`;
+  const goalCount = allEvents.filter(e => e.isGoal).length;
+  const matchSummary = `${match.team1} ${g1}-${g2} ${match.team2} (${match.date}, ${venue}).${isLive ? ` ŞU AN CANLI: ${espnStatus.clock}.` : ''} İY: ${htScore ? htScore.join('-') : '?'}. Sahip olma: ${hStats.possessionPct||'?'}% vs ${aStats.possessionPct||'?'}%. Şut: ${hStats.totalShots||'?'}/${aStats.totalShots||'?'}. xG: ${hStats.expectedGoals||'?'}/${aStats.expectedGoals||'?'}. Olaylar: ${allEvents.map(e => `${e.icon} ${e.name} ${e.minute}' (${e.team})`).join(', ')||'yok'}.`;
 
   return (
     <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
@@ -115,6 +126,11 @@ export function MatchDetailModal({ match, espnData, onClose }) {
         <div className="modal-body">
           {/* Scoreline */}
           <div className="scoreline">
+            {isLive && (
+              <div className="live-modal-banner">
+                <span className="live-dot" style={{ background: 'var(--red)' }} /> CANLI · {espnStatus.clock || ''}
+              </div>
+            )}
             <div className="scoreline-teams">
               <div className="sl-team">
                 <span className="sl-flag">{getFlag(match.team1)}</span>
@@ -136,18 +152,18 @@ export function MatchDetailModal({ match, espnData, onClose }) {
             {venue && <div style={{ fontSize: 10, color: 'var(--muted)', marginTop: 6 }}>📍 {venue}</div>}
           </div>
 
-          {/* Goals */}
-          {allGoals.length > 0 && (
+          {/* Events */}
+          {allEvents.length > 0 && (
             <div style={{ marginBottom: 14 }}>
-              <div className="stat-section-title">⚽ GOL TİMELİNE</div>
-              {allGoals.map((g, i) => (
+              <div className="stat-section-title">{goalCount > 0 ? '⚽' : '🕐'} MAÇ OLAYLARI</div>
+              {allEvents.map((g, i) => (
                 <div key={i} style={{
                   display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px',
                   borderRadius: 5, background: 'rgba(255,255,255,.02)',
                   borderLeft: `2px solid ${g.side === 'home' ? 'var(--green)' : 'var(--blue)'}`, marginBottom: 4
                 }}>
                   <span style={{ fontFamily: "'Barlow Condensed',sans-serif", fontSize: 13, fontWeight: 700, color: 'var(--gold)', minWidth: 30 }}>{g.minute}'</span>
-                  <span>⚽</span>
+                  <span>{g.icon}</span>
                   <span style={{ fontSize: 11, fontWeight: 600 }}>{g.name}</span>
                   <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--muted)' }}>{getFlag(g.team)} {g.team}</span>
                 </div>
@@ -188,12 +204,12 @@ export function MatchDetailModal({ match, espnData, onClose }) {
           <AiChat
             systemPrompt={`Sen bir futbol analisti asistanısın. Türkçe kısa ve net cevaplar ver. Markdown kullanma.\n\nMAÇ VERİSİ:\n${matchSummary}`}
             placeholder="Bu maç hakkında bir şey sor..."
-            initialMsg={`${match.team1} ${g1}-${g2} ${match.team2} maçı hazır. Taktikler, goller veya performans hakkında soru sor.`}
+            initialMsg={isLive ? `${match.team1} ${g1}-${g2} ${match.team2} maçı şu an canlı (${espnStatus.clock}). Anlık durum, taktikler veya olaylar hakkında soru sor.` : `${match.team1} ${g1}-${g2} ${match.team2} maçı hazır. Taktikler, goller veya performans hakkında soru sor.`}
             suggestions={[
               `${match.team1} ve ${match.team2}'nin taktik farklarını analiz et`,
-              'Maçın kilit anı neydi?',
+              isLive ? 'Şu ana kadarki en kritik an neydi?' : 'Maçın kilit anı neydi?',
               'En iyi oyuncu kimdi?',
-              `${Number(g1) > Number(g2) ? match.team1 : Number(g2) > Number(g1) ? match.team2 : 'İki takım'} nasıl ${Number(g1) !== Number(g2) ? 'kazandı?' : 'berabere kaldı?'}`,
+              `${Number(g1) > Number(g2) ? match.team1 : Number(g2) > Number(g1) ? match.team2 : 'İki takım'} nasıl ${Number(g1) !== Number(g2) ? (isLive ? 'önde?' : 'kazandı?') : 'berabere?'}`,
             ]}
           />
         </div>
