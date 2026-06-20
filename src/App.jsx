@@ -1,11 +1,12 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import './App.css';
 import { OFB_URL, ESPN_BASE, GROUP_TEAMS } from './constants.js';
-import { computeStandings, simulateGroup, getFlag } from './utils.js';
+import { computeStandings, simulateGroup, getFlag, getEspnStatus, getEspnEventsRaw } from './utils.js';
 import GroupsTab from './tabs/GroupsTab.jsx';
 import MatchesTab, { MatchDetailModal } from './tabs/MatchesTab.jsx';
 import BracketTab from './tabs/BracketTab.jsx';
 import PlayerTab from './tabs/PlayerTab.jsx';
+import LiveTicker from './components/LiveTicker.jsx';
 
 const TABS = [
   { id: 'groups', label: '📊 PUAN' },
@@ -13,6 +14,9 @@ const TABS = [
   { id: 'bracket', label: '🗓️ BRACKET' },
   { id: 'player', label: '🔍 OYUNCU' },
 ];
+
+const LIVE_POLL_MS = 25000;
+const IDLE_POLL_MS = 120000;
 
 export default function App() {
   const [tab, setTab] = useState('groups');
@@ -24,6 +28,14 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [selectedMatch, setSelectedMatch] = useState(null);
   const [selectedEspnData, setSelectedEspnData] = useState(null);
+  const [selectedEspnId, setSelectedEspnId] = useState(null);
+  const [toast, setToast] = useState(null);
+
+  const matchesRef = useRef(matches);
+  const seenEventsRef = useRef({}); // espnEventId -> Set(eventKey)
+  const isFirstFetchRef = useRef(true);
+  const hasLiveRef = useRef(false);
+  const toastTimerRef = useRef(null);
 
   const buildGroupRank = useCallback((newMatches, st) => {
     const gr = {};
@@ -48,32 +60,72 @@ export default function App() {
       fetch(OFB_URL + '?_=' + Date.now()).then(r => r.json()),
       fetch(`${ESPN_BASE}/scoreboard?limit=200&dates=20260611-20260719&_=${Date.now()}`).then(r => r.json()),
     ]);
-    let newMatches = matches;
+    let newMatches = matchesRef.current;
     if (ofbRes.status === 'fulfilled') newMatches = ofbRes.value.matches || [];
     const newEspn = {};
     if (espnRes.status === 'fulfilled') (espnRes.value.events||[]).forEach(e => { newEspn[e.id] = e; });
+
+    // Canlı maçlardaki yeni "önemli an"ları tespit et (toast için)
+    let hasLive = false;
+    const newToasts = [];
+    Object.entries(newEspn).forEach(([id, ev]) => {
+      const status = getEspnStatus(ev);
+      if (status.state !== 'in') return;
+      hasLive = true;
+      const events = getEspnEventsRaw(ev).filter(e => e.important);
+      const prevSeen = seenEventsRef.current[id] || new Set();
+      if (!isFirstFetchRef.current) {
+        events.forEach(e => {
+          if (!prevSeen.has(e.key)) newToasts.push({ ...e, matchName: ev.shortName || ev.name });
+        });
+      }
+      seenEventsRef.current[id] = new Set(events.map(e => e.key));
+    });
+    hasLiveRef.current = hasLive;
+    isFirstFetchRef.current = false;
+
+    if (newToasts.length > 0) {
+      const t = newToasts[newToasts.length - 1];
+      setToast(t);
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = setTimeout(() => setToast(null), 7000);
+    }
+
     const st = computeStandings(newMatches);
     const gr = buildGroupRank(newMatches, st);
-    setMatches(newMatches); setEspnById(newEspn); setStandings(st); setGroupRank(gr);
+    setMatches(newMatches); matchesRef.current = newMatches;
+    setEspnById(newEspn); setStandings(st); setGroupRank(gr);
     setLastUpdated('Son güncelleme: ' + new Date().toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' }));
     setRefreshing(false);
   }, [buildGroupRank]);
 
   useEffect(() => {
-    fetchAll();
-    const iv = setInterval(fetchAll, 120000);
-    return () => clearInterval(iv);
+    let timer;
+    let cancelled = false;
+    const schedule = async () => {
+      await fetchAll();
+      if (cancelled) return;
+      const delay = hasLiveRef.current ? LIVE_POLL_MS : IDLE_POLL_MS;
+      timer = setTimeout(schedule, delay);
+    };
+    schedule();
+    return () => { cancelled = true; clearTimeout(timer); clearTimeout(toastTimerRef.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function handleMatchClick(m, espnId) {
-    setSelectedMatch(m); setSelectedEspnData(null);
+    setSelectedMatch(m); setSelectedEspnData(null); setSelectedEspnId(espnId || null);
     if (espnId) {
       try {
         const r = await fetch(`${ESPN_BASE}/summary?event=${espnId}&_=${Date.now()}`);
         if (r.ok) setSelectedEspnData(await r.json());
-      } catch (e) {}
+      } catch {
+        // özet verisi alınamadı, canlı skor/skorboard verisiyle devam edilir
+      }
     }
   }
+
+  const liveCount = Object.values(espnById).filter(ev => getEspnStatus(ev).state === 'in').length;
 
   return (
     <div style={{ background: 'var(--bg)', minHeight: '100vh' }}>
@@ -86,7 +138,11 @@ export default function App() {
           </div>
         </div>
         <div className="header-right">
-          <div className="live-dot" />
+          {liveCount > 0 && (
+            <span className="live-count-badge">
+              <span className="live-dot" style={{ background: 'var(--red)' }} /> {liveCount} CANLI
+            </span>
+          )}
           <span className="header-updated">{lastUpdated}</span>
           <button className="btn btn-ghost" onClick={fetchAll} disabled={refreshing}>
             {refreshing ? '⏳' : '⟳'} Güncelle
@@ -103,6 +159,7 @@ export default function App() {
       </div>
 
       <div className="content">
+        <LiveTicker matches={matches} espnById={espnById} onMatchClick={handleMatchClick} />
         {tab === 'groups' && <GroupsTab matches={matches} standings={standings} groupRank={groupRank} />}
         {tab === 'matches' && <MatchesTab matches={matches} espnById={espnById} onMatchClick={handleMatchClick} />}
         {tab === 'bracket' && <BracketTab groupRank={groupRank} />}
@@ -113,8 +170,19 @@ export default function App() {
         <MatchDetailModal
           match={selectedMatch}
           espnData={selectedEspnData}
-          onClose={() => { setSelectedMatch(null); setSelectedEspnData(null); }}
+          liveEvent={selectedEspnId ? espnById[selectedEspnId] : null}
+          onClose={() => { setSelectedMatch(null); setSelectedEspnData(null); setSelectedEspnId(null); }}
         />
+      )}
+
+      {toast && (
+        <div className="event-toast" onClick={() => setToast(null)}>
+          <span className="event-toast-icon">{toast.icon}</span>
+          <div>
+            <div className="event-toast-title">{toast.label}{toast.player ? ` — ${toast.player}` : ''}</div>
+            <div className="event-toast-sub">{getFlag(toast.team)} {toast.team} · {toast.minute}' · {toast.matchName}</div>
+          </div>
+        </div>
       )}
     </div>
   );
